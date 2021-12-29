@@ -3,7 +3,8 @@ import random
 import rclpy
 import threading
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import OccupancyGrid, Path, Odometry
+from visualization_msgs.msg import Marker
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy, QoSReliabilityPolicy
 
@@ -40,10 +41,10 @@ class RRT:
                  goal,
                  obstacle_list,
                  rand_area,
-                 expand_dis=3.0,
-                 path_resolution=0.5,
+                 expand_dis=0.25,
+                 path_resolution=0.01,
                  goal_sample_rate=5,
-                 max_iter=500,
+                 max_iter=1000,
                  play_area=None
                  ):
         """
@@ -71,7 +72,7 @@ class RRT:
         self.obstacle_list = obstacle_list
         self.node_list = []
 
-    def planning(self):
+    def planning(self, animation=True):
         """
         rrt path planning
 
@@ -187,7 +188,6 @@ class RRT:
 
     @staticmethod
     def check_collision(node, obstacleList):
-
         if node is None:
             return False
 
@@ -216,37 +216,108 @@ class PlanPublisher(Node):
     def __init__(self):
         # plan setter
         super().__init__('rrt_plan')
-        self.plan_publisher = self.create_publisher(Path, "rrt_plan", 1)
-        self.timer = self.create_timer(1, self.publish_plan)
+        qos_profile = QoSProfile(depth=10)
+        self.plan_publisher = self.create_publisher(Path, "rrt_plan", qos_profile)
+        self.marker_publisher = self.create_publisher(Marker, "visual_marker", 1)
+
+        self.timer = self.create_timer(5, self.publish_plan)
+        self.marker_timer = self.create_timer(1, self.publish_marker)
+
+        self.odom_instance = OdomSubscriber.instance()
         self.map_instance = GetMapFromSlam.instance()
 
         # rrt planner
-        obstacleList = [(5, 5, 1), (3, 6, 2), (3, 8, 2), (3, 10, 2), (7, 5, 2),
-                        (9, 5, 2), (8, 10, 1)]
-        self.rrt = RRT(
-            start=[self.map_instance.pose_x, self.map_instance.pose_y],
-            goal=[-2.95, -2.56],
-            rand_area=[-2, 15],
-            obstacle_list=obstacleList
-        )
-        path = self.rrt.planning()
-        if path is None:
-            print("Cannot find path")
-        else:
-            print(path)
-            print("found path!!")
+        self.obstacle_list = []
+        self.rrt = None
 
     def publish_plan(self):
+        for i, occupancy in enumerate(self.map_instance.occupancy_map):
+            cell_x_pose = self.map_instance.resolution * (i % self.map_instance.map_width) + self.map_instance.pose_x
+            cell_y_pose = self.map_instance.resolution * (i // self.map_instance.map_width) + self.map_instance.pose_y
+            if occupancy == -1 or occupancy == 100:
+                self.obstacle_list.append((cell_x_pose, cell_y_pose, 0.1))
+
+        # robot grid path not odom
+        robot_x = (self.odom_instance.odom_x - self.map_instance.pose_x) // self.map_instance.resolution
+        robot_y = (self.odom_instance.odom_y - self.map_instance.pose_y) // self.map_instance.resolution
+
+        self.rrt = RRT(
+            start=[self.odom_instance.odom_x, self.odom_instance.odom_y],
+            goal=[-2.0076470375061035, -0.045913245528936386],
+            rand_area=[-2.5, 2.5],
+            obstacle_list=self.obstacle_list
+        )
+
+        rrt_path = self.rrt.planning()
+        if rrt_path is None:
+            print("Cannot find path")
+        else:
+            print(rrt_path)
+            print("found path!!")
+
         path = Path()
         path.header.frame_id = 'map'
 
-        for now_pose in [[0.0, 0.0], [0.5, 0.25], [1.0, 0.5], [1.5, 0.75]]:
+        for now_pose in rrt_path:
             pose = PoseStamped()
             pose.pose.position.x = now_pose[0]
             pose.pose.position.y = now_pose[1]
             path.poses.append(pose)
 
         self.plan_publisher.publish(path)
+
+    def publish_marker(self):
+        marker = Marker()
+        marker.type = 3
+        marker.id = 10
+        marker.scale.x = 10.0
+        marker.scale.y = 10.0
+        marker.scale.z = 10.0
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        marker.pose.position.x = 0.0
+        marker.pose.position.y = 0.0
+        marker.pose.position.z = 0.0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+
+        self.marker_publisher.publish(marker)
+
+
+class OdomSubscriber(Node):
+    __instance = None
+
+    @classmethod
+    def __getInstance(cls):
+        return cls.__instance
+
+    @classmethod
+    def instance(cls, *args, **kwargs):
+        cls.__instance = cls(*args, **kwargs)
+        cls.instance = cls.__getInstance
+        return cls.__instance
+
+    def __init__(self):
+        super().__init__('odom_subscriber')
+
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+
+        qos_profile = QoSProfile(depth=10)
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            qos_profile
+        )
+
+    def odom_callback(self, msg):
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
 
 
 class GetMapFromSlam(Node):
@@ -263,6 +334,8 @@ class GetMapFromSlam(Node):
         return cls.__instance
 
     def __init__(self):
+        super().__init__('get_map_from_slam')
+
         self.occupancy_map = []
         self.map_width = 0.0
         self.map_height = 0.0
@@ -275,7 +348,6 @@ class GetMapFromSlam(Node):
         self.orientation_z = 0.0
         self.orientation_w = 0.0
 
-        super().__init__('get_map_from_slam')
         qos_profile = QoSProfile(
             depth=10,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -301,16 +373,18 @@ class GetMapFromSlam(Node):
         self.orientation_y = msg.info.origin.orientation.y
         self.orientation_z = msg.info.origin.orientation.z
         self.orientation_w = msg.info.origin.orientation.w
-        for i in range(self.map_height):
-            print(self.occupancy_map[i * self.map_width:i * self.map_width + self.map_width])
+        # for i in range(self.map_height):
+        #     print(self.occupancy_map[i * self.map_width:i * self.map_width + self.map_width])
 
 
 def main(args=None):
     rclpy.init(args=args)
     get_map_node = GetMapFromSlam.instance()
+    odom_sub = OdomSubscriber.instance()
     plan_publisher = PlanPublisher()
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(get_map_node)
+    executor.add_node(odom_sub)
     executor.add_node(plan_publisher)
     executor_thread = threading.Thread(target=executor.spin, daemon=True)
     executor_thread.start()
